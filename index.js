@@ -753,6 +753,8 @@ Try asking: "What are the required parameters?" or "How does IPN work?" or "Show
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SERVER FACTORY — fresh instance per connection (required for SSE)
 // ─────────────────────────────────────────────────────────────────────────────
 function createServer() {
@@ -765,20 +767,14 @@ function createServer() {
     tools: [
       {
         name: "ask_sslcommerz",
-        description:
-          "Ask any question about SSLCommerz integration in plain English. " +
-          "Covers: payment flow, API endpoints, parameters, IPN, validation, " +
-          "refund, transaction query, test cards, gateways, security, SDKs, EMI, and more.",
+        description: "Ask any question about SSLCommerz integration in plain English. Covers: payment flow, API endpoints, parameters, IPN, validation, refund, transaction query, test cards, gateways, security, SDKs, EMI, and more.",
         inputSchema: {
           type: "object",
           properties: {
-            question: {
-              type: "string",
-              description: "Your question in plain English. E.g. 'What are the required parameters?' or 'How does IPN work?'",
-            },
+            question: { type: "string", description: "Your question. E.g. 'What are the required parameters?' or 'How does IPN work?'" }
           },
-          required: ["question"],
-        },
+          required: ["question"]
+        }
       },
       {
         name: "get_code_snippet",
@@ -788,11 +784,11 @@ function createServer() {
           properties: {
             language: {
               type: "string",
-              enum: ["nodejs_initiate", "nodejs_validate_ipn", "nodejs_refund", "nodejs_query_by_tran", "php_initiate", "php_validate", "python_initiate", "nextjs_initiate"],
-            },
+              enum: ["nodejs_initiate","nodejs_validate_ipn","nodejs_refund","nodejs_query_by_tran","php_initiate","php_validate","python_initiate","nextjs_initiate"]
+            }
           },
-          required: ["language"],
-        },
+          required: ["language"]
+        }
       },
       {
         name: "get_sslcommerz_info",
@@ -802,125 +798,115 @@ function createServer() {
           properties: {
             topic: {
               type: "string",
-              enum: ["environments", "test_cards", "request_params", "response_params", "gateways", "transaction_statuses", "security_checklist", "refund_api", "query_api", "libraries", "easy_checkout", "common_issues"],
-            },
+              enum: ["environments","test_cards","request_params","response_params","gateways","transaction_statuses","security_checklist","refund_api","query_api","libraries","easy_checkout","common_issues"]
+            }
           },
-          required: ["topic"],
-        },
-      },
-    ],
+          required: ["topic"]
+        }
+      }
+    ]
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-
     if (name === "ask_sslcommerz") {
       return { content: [{ type: "text", text: answerQuestion(args.question) }] };
     }
     if (name === "get_code_snippet") {
       const snippet = SNIPPETS[args.language];
-      if (!snippet) throw new Error(`Unknown snippet: ${args.language}`);
+      if (!snippet) throw new Error("Unknown snippet: " + args.language);
       return { content: [{ type: "text", text: snippet }] };
     }
     if (name === "get_sslcommerz_info") {
       const data = KB[args.topic];
-      if (!data) throw new Error(`Unknown topic: ${args.topic}`);
+      if (!data) throw new Error("Unknown topic: " + args.topic);
       return { content: [{ type: "text", text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }] };
     }
-    throw new Error(`Unknown tool: ${name}`);
+    throw new Error("Unknown tool: " + name);
   });
 
   return server;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TRANSPORT — HTTP/SSE for cloud, stdio for local
+// TRANSPORT
 // ─────────────────────────────────────────────────────────────────────────────
-const USE_HTTP = process.env.TRANSPORT === "http" || process.env.PORT;
+const USE_HTTP = process.env.TRANSPORT === "http" || !!process.env.PORT;
 
 if (USE_HTTP) {
-  // ── Cloud / Railway mode ──────────────────────────────────────────────────
   const app = express();
   app.use(express.json());
 
-  // Store both transport AND server together per session
-  const sessions = new Map(); // sessionId → { transport, server }
+  // sessionId -> { transport, server }
+  const sessions = new Map();
 
-  // Health check
-  app.get("/", (req, res) => {
-    res.json({ status: "ok", name: "sslcommerz-knowledge-mcp", version: "2.0.0", sessions: sessions.size });
+  app.get("/", (_req, res) => {
+    res.json({ status: "ok", name: "sslcommerz-knowledge-mcp", version: "2.0.0" });
   });
 
-  // SSE endpoint
   app.get("/sse", async (req, res) => {
-    // Critical headers to prevent Railway/nginx from closing the stream
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-    res.setHeader("X-Accel-Buffering", "no");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.flushHeaders();
-
-    // Keep TCP connection alive
+    // Set TCP options BEFORE touching res
     req.socket.setTimeout(0);
     req.socket.setNoDelay(true);
     req.socket.setKeepAlive(true, 10000);
 
+    // IMPORTANT: do NOT set any headers or call flushHeaders() here.
+    // SSEServerTransport must be the first thing to write to res.
     const mcpServer = createServer();
     const transport = new SSEServerTransport("/messages", res);
-
-    // Send heartbeat comment every 15s to prevent Railway idle timeout
-    const heartbeat = setInterval(() => {
-      if (!res.writableEnded) {
-        res.write(": heartbeat\n\n");
-      }
-    }, 15000);
+    let heartbeat = null;
 
     res.on("close", () => {
-      clearInterval(heartbeat);
+      if (heartbeat) clearInterval(heartbeat);
       sessions.delete(transport.sessionId);
-      console.error(`[SSE] Session closed: ${transport.sessionId}`);
+      console.error("[SSE] closed:", transport.sessionId);
     });
 
     try {
+      // connect() is what sends headers + the endpoint event line
       await mcpServer.connect(transport);
-      // Store BOTH so /messages can call handlePostMessage on correct transport
+
+      // Safe to write SSE comments now that headers are gone
+      heartbeat = setInterval(() => {
+        if (!res.writableEnded) {
+          res.write(": ping\n\n");
+        } else {
+          clearInterval(heartbeat);
+        }
+      }, 15000);
+
       sessions.set(transport.sessionId, { transport, server: mcpServer });
-      console.error(`[SSE] Session ready: ${transport.sessionId}`);
+      console.error("[SSE] ready:", transport.sessionId);
     } catch (err) {
-      clearInterval(heartbeat);
-      console.error("[SSE] Connect error:", err.message);
+      if (heartbeat) clearInterval(heartbeat);
+      console.error("[SSE] error:", err.message);
       if (!res.writableEnded) res.end();
     }
   });
 
-  // Messages endpoint
   app.post("/messages", async (req, res) => {
-    const sessionId = req.query.sessionId;
-    const session = sessions.get(sessionId);
-
+    const sid = req.query.sessionId;
+    const session = sessions.get(sid);
     if (!session) {
-      console.error(`[POST] Unknown session: ${sessionId}`);
-      return res.status(400).json({ error: `Unknown session: ${sessionId}` });
+      console.error("[POST] unknown session:", sid);
+      return res.status(400).json({ error: "Unknown session: " + sid });
     }
-
     try {
       await session.transport.handlePostMessage(req, res);
     } catch (err) {
-      console.error("[POST] Error:", err.message);
+      console.error("[POST] error:", err.message);
       if (!res.headersSent) res.status(500).json({ error: err.message });
     }
   });
 
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, "0.0.0.0", () => {
-    console.error(`✅ SSLCommerz MCP (SSE) live on port ${PORT}`);
+    console.error("SSLCommerz MCP (SSE) running on port " + PORT);
   });
 
 } else {
-  // ── Local stdio mode ──────────────────────────────────────────────────────
   const server = createServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("✅ SSLCommerz Knowledge MCP server v2.0 running (stdio)");
+  console.error("SSLCommerz MCP (stdio) ready");
 }
