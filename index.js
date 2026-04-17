@@ -758,94 +758,91 @@ Try asking: "What are the required parameters?" or "How does IPN work?" or "Show
 // ─────────────────────────────────────────────────────────────────────────────
 // MCP SERVER SETUP
 // ─────────────────────────────────────────────────────────────────────────────
-const server = new Server(
+function createServer() {
+  const server = new Server(
     { name: "sslcommerz-knowledge-mcp", version: "2.0.0" },
     { capabilities: { tools: {} } }
-);
+  );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({
+        tools: [
         {
             name: "ask_sslcommerz",
-            description:
-                "Ask any question about SSLCommerz integration in plain English. " +
-                "Covers: payment flow, API endpoints, parameters, IPN, validation, " +
-                "refund, transaction query, test cards, gateways, security, SDKs, EMI, and more.",
+            description: "Ask any question about SSLCommerz integration",
             inputSchema: {
-                type: "object",
-                properties: {
-                    question: {
-                        type: "string",
-                        description: "Your question in plain English. E.g. 'What are the required parameters?' or 'How does IPN work?'",
-                    },
-                },
-                required: ["question"],
+            type: "object",
+            properties: {
+                question: { type: "string" }
             },
+            required: ["question"]
+            }
         },
         {
             name: "get_code_snippet",
-            description: "Get a ready-to-use SSLCommerz code snippet for a specific language and use case.",
+            description: "Get SSLCommerz code snippet",
             inputSchema: {
-                type: "object",
-                properties: {
-                    language: {
-                        type: "string",
-                        enum: ["nodejs_initiate", "nodejs_validate_ipn", "nodejs_refund", "nodejs_query_by_tran", "php_initiate", "php_validate", "python_initiate", "nextjs_initiate"],
-                    },
-                },
-                required: ["language"],
+            type: "object",
+            properties: {
+                language: {
+                type: "string",
+                enum: ["nodejs_initiate","nodejs_validate_ipn","nodejs_refund","php_initiate","php_validate","python_initiate","nextjs_initiate"]
+                }
             },
+            required: ["language"]
+            }
         },
         {
             name: "get_sslcommerz_info",
-            description: "Get structured SSLCommerz data by topic.",
+            description: "Get structured SSLCommerz data by topic",
             inputSchema: {
-                type: "object",
-                properties: {
-                    topic: {
-                        type: "string",
-                        enum: ["environments", "test_cards", "request_params", "response_params", "gateways", "transaction_statuses", "security_checklist", "refund_api", "query_api", "libraries", "easy_checkout", "common_issues"],
-                    },
-                },
-                required: ["topic"],
+            type: "object",
+            properties: {
+                topic: {
+                type: "string",
+                enum: ["environments","test_cards","request_params","response_params","gateways","transaction_statuses","security_checklist","refund_api","libraries"]
+                }
             },
-        },
-    ],
-}));
+            required: ["topic"]
+            }
+        }
+        ]
+    }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
     if (name === "ask_sslcommerz") {
-        const answer = answerQuestion(args.question);
-        return { content: [{ type: "text", text: answer }] };
+      return { content: [{ type: "text", text: answerQuestion(args.question) }] };
     }
-
     if (name === "get_code_snippet") {
-        const snippet = SNIPPETS[args.language];
-        if (!snippet) throw new Error(`Unknown snippet: ${args.language}`);
-        return { content: [{ type: "text", text: snippet }] };
+      const snippet = SNIPPETS[args.language];
+      if (!snippet) throw new Error(`Unknown snippet: ${args.language}`);
+      return { content: [{ type: "text", text: snippet }] };
     }
-
     if (name === "get_sslcommerz_info") {
-        const data = KB[args.topic];
-        if (!data) throw new Error(`Unknown topic: ${args.topic}`);
-        return { content: [{ type: "text", text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }] };
+      const data = KB[args.topic];
+      if (!data) throw new Error(`Unknown topic: ${args.topic}`);
+      return { content: [{ type: "text", text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }] };
     }
 
     throw new Error(`Unknown tool: ${name}`);
-});
+  });
 
-// const transport = new StdioServerTransport();
-// await server.connect(transport);
-// console.error("✅ SSLCommerz Knowledge MCP server v2.0 running");
+  return server;
+}
 
-// Replace the bottom transport section with:
+// 4. Routes
 const transports = {};
 
 app.get("/sse", async (req, res) => {
+  const server = createServer();           // ✅ fresh instance every time
   const transport = new SSEServerTransport("/messages", res);
   transports[transport.sessionId] = transport;
+
+  res.on("close", () => {
+    delete transports[transport.sessionId]; // cleanup on disconnect
+  });
+
   await server.connect(transport);
 });
 
@@ -855,10 +852,10 @@ app.post("/messages", async (req, res) => {
   if (transport) {
     await transport.handlePostMessage(req, res);
   } else {
-    res.status(400).send("Unknown session");
+    res.status(400).json({ error: "Unknown session ID" });
   }
 });
 
-
+// 5. Start
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`SSLCommerz MCP running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ SSLCommerz MCP running on port ${PORT}`));
