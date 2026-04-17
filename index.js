@@ -843,63 +843,78 @@ if (USE_HTTP) {
   const app = express();
   app.use(express.json());
 
-  const transports = new Map();
+  // Store both transport AND server together per session
+  const sessions = new Map(); // sessionId → { transport, server }
 
-  // Health check — Railway uses this to confirm service is up
+  // Health check
   app.get("/", (req, res) => {
-    res.json({ status: "ok", name: "sslcommerz-knowledge-mcp", version: "2.0.0" });
+    res.json({ status: "ok", name: "sslcommerz-knowledge-mcp", version: "2.0.0", sessions: sessions.size });
   });
 
-  // SSE endpoint — client connects here first
+  // SSE endpoint
   app.get("/sse", async (req, res) => {
-    // Keep connection alive for Railway's idle timeout
+    // Critical headers to prevent Railway/nginx from closing the stream
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.flushHeaders();
+
+    // Keep TCP connection alive
     req.socket.setTimeout(0);
     req.socket.setNoDelay(true);
-    req.socket.setKeepAlive(true);
+    req.socket.setKeepAlive(true, 10000);
 
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
-    res.setHeader("X-Accel-Buffering", "no"); // disable nginx buffering
-
-    const server = createServer();                        // ✅ fresh per connection
+    const mcpServer = createServer();
     const transport = new SSEServerTransport("/messages", res);
-    transports.set(transport.sessionId, transport);
+
+    // Send heartbeat comment every 15s to prevent Railway idle timeout
+    const heartbeat = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write(": heartbeat\n\n");
+      }
+    }, 15000);
 
     res.on("close", () => {
-      transports.delete(transport.sessionId);
-      console.error(`Session closed: ${transport.sessionId}`);
+      clearInterval(heartbeat);
+      sessions.delete(transport.sessionId);
+      console.error(`[SSE] Session closed: ${transport.sessionId}`);
     });
 
     try {
-      await server.connect(transport);
-      console.error(`Session started: ${transport.sessionId}`);
+      await mcpServer.connect(transport);
+      // Store BOTH so /messages can call handlePostMessage on correct transport
+      sessions.set(transport.sessionId, { transport, server: mcpServer });
+      console.error(`[SSE] Session ready: ${transport.sessionId}`);
     } catch (err) {
-      console.error("SSE connect error:", err);
-      res.end();
+      clearInterval(heartbeat);
+      console.error("[SSE] Connect error:", err.message);
+      if (!res.writableEnded) res.end();
     }
   });
 
-  // Messages endpoint — client POSTs tool calls here
+  // Messages endpoint
   app.post("/messages", async (req, res) => {
     const sessionId = req.query.sessionId;
-    const transport = transports.get(sessionId);
-    if (!transport) {
+    const session = sessions.get(sessionId);
+
+    if (!session) {
+      console.error(`[POST] Unknown session: ${sessionId}`);
       return res.status(400).json({ error: `Unknown session: ${sessionId}` });
     }
+
     try {
-      await transport.handlePostMessage(req, res);
+      await session.transport.handlePostMessage(req, res);
     } catch (err) {
-      console.error("Message error:", err);
-      res.status(500).json({ error: err.message });
+      console.error("[POST] Error:", err.message);
+      if (!res.headersSent) res.status(500).json({ error: err.message });
     }
   });
 
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, "0.0.0.0", () => {
-    console.error(`✅ SSLCommerz MCP (HTTP/SSE) running on port ${PORT}`);
-    console.error(`   SSE  → http://0.0.0.0:${PORT}/sse`);
-    console.error(`   POST → http://0.0.0.0:${PORT}/messages`);
+    console.error(`✅ SSLCommerz MCP (SSE) live on port ${PORT}`);
   });
 
 } else {
