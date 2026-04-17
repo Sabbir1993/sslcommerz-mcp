@@ -1,11 +1,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
+import { randomUUID } from "crypto";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FULL KNOWLEDGE BASE  (scraped from https://developer.sslcommerz.com/doc/v4/)
@@ -755,7 +751,7 @@ Try asking: "What are the required parameters?" or "How does IPN work?" or "Show
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SERVER FACTORY — fresh instance per connection (required for SSE)
+// SERVER FACTORY
 // ─────────────────────────────────────────────────────────────────────────────
 function createServer() {
   const server = new Server(
@@ -771,14 +767,14 @@ function createServer() {
         inputSchema: {
           type: "object",
           properties: {
-            question: { type: "string", description: "Your question. E.g. 'What are the required parameters?' or 'How does IPN work?'" }
+            question: { type: "string", description: "Your question in plain English." }
           },
           required: ["question"]
         }
       },
       {
         name: "get_code_snippet",
-        description: "Get a ready-to-use SSLCommerz code snippet for a specific language and use case.",
+        description: "Get a ready-to-use SSLCommerz code snippet.",
         inputSchema: {
           type: "object",
           properties: {
@@ -835,50 +831,96 @@ const USE_HTTP = process.env.TRANSPORT === "http" || !!process.env.PORT;
 
 if (USE_HTTP) {
   const app = express();
+
+  // Must parse raw body for Streamable HTTP
   app.use(express.json());
+  app.use(express.raw({ type: "application/octet-stream" }));
 
-  // sessionId -> { transport, server }
-  const sessions = new Map();
-
+  // Health check
   app.get("/", (_req, res) => {
     res.json({ status: "ok", name: "sslcommerz-knowledge-mcp", version: "2.0.0" });
   });
 
+  // ── Streamable HTTP endpoint (what mcp-remote tries FIRST as http-first) ──
+  // Single /mcp endpoint handles both GET (SSE stream) and POST (messages)
+  const { StreamableHTTPServerTransport } = await import("@modelcontextprotocol/sdk/server/streamableHttp.js");
+  const { isInitializeRequest } = await import("@modelcontextprotocol/sdk/types.js");
+
+  const sessions = new Map(); // sessionId -> transport
+
+  app.post("/mcp", async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"];
+
+    let transport;
+    if (sessionId && sessions.has(sessionId)) {
+      transport = sessions.get(sessionId);
+    } else if (!sessionId && isInitializeRequest(req.body)) {
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (id) => {
+          sessions.set(id, transport);
+          console.error("[MCP] session created:", id);
+        }
+      });
+      transport.onclose = () => {
+        sessions.delete(transport.sessionId);
+        console.error("[MCP] session closed:", transport.sessionId);
+      };
+      const server = createServer();
+      await server.connect(transport);
+    } else {
+      return res.status(400).json({ error: "Bad request: missing or unknown session" });
+    }
+
+    await transport.handleRequest(req, res, req.body);
+  });
+
+  app.get("/mcp", async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"];
+    if (!sessionId || !sessions.has(sessionId)) {
+      return res.status(400).json({ error: "Unknown session" });
+    }
+    await sessions.get(sessionId).handleRequest(req, res);
+  });
+
+  app.delete("/mcp", async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"];
+    if (sessionId && sessions.has(sessionId)) {
+      await sessions.get(sessionId).close();
+      sessions.delete(sessionId);
+    }
+    res.status(200).end();
+  });
+
+  // ── Legacy SSE fallback (for older clients) ──────────────────────────────
+  const { SSEServerTransport } = await import("@modelcontextprotocol/sdk/server/sse.js");
+  const sseSessions = new Map();
+
   app.get("/sse", async (req, res) => {
-    // Set TCP options BEFORE touching res
     req.socket.setTimeout(0);
     req.socket.setNoDelay(true);
     req.socket.setKeepAlive(true, 10000);
 
-    // IMPORTANT: do NOT set any headers or call flushHeaders() here.
-    // SSEServerTransport must be the first thing to write to res.
     const mcpServer = createServer();
     const transport = new SSEServerTransport("/messages", res);
     let heartbeat = null;
 
     res.on("close", () => {
-      if (heartbeat) clearInterval(heartbeat);
-      sessions.delete(transport.sessionId);
+      clearInterval(heartbeat);
+      sseSessions.delete(transport.sessionId);
       console.error("[SSE] closed:", transport.sessionId);
     });
 
     try {
-      // connect() is what sends headers + the endpoint event line
       await mcpServer.connect(transport);
-
-      // Safe to write SSE comments now that headers are gone
       heartbeat = setInterval(() => {
-        if (!res.writableEnded) {
-          res.write(": ping\n\n");
-        } else {
-          clearInterval(heartbeat);
-        }
+        if (!res.writableEnded) res.write(": ping\n\n");
+        else clearInterval(heartbeat);
       }, 15000);
-
-      sessions.set(transport.sessionId, { transport, server: mcpServer });
+      sseSessions.set(transport.sessionId, transport);
       console.error("[SSE] ready:", transport.sessionId);
     } catch (err) {
-      if (heartbeat) clearInterval(heartbeat);
+      clearInterval(heartbeat);
       console.error("[SSE] error:", err.message);
       if (!res.writableEnded) res.end();
     }
@@ -886,27 +928,27 @@ if (USE_HTTP) {
 
   app.post("/messages", async (req, res) => {
     const sid = req.query.sessionId;
-    const session = sessions.get(sid);
-    if (!session) {
-      console.error("[POST] unknown session:", sid);
-      return res.status(400).json({ error: "Unknown session: " + sid });
-    }
+    const transport = sseSessions.get(sid);
+    if (!transport) return res.status(400).json({ error: "Unknown session: " + sid });
     try {
-      await session.transport.handlePostMessage(req, res);
+      await transport.handlePostMessage(req, res);
     } catch (err) {
-      console.error("[POST] error:", err.message);
+      console.error("[SSE POST] error:", err.message);
       if (!res.headersSent) res.status(500).json({ error: err.message });
     }
   });
 
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, "0.0.0.0", () => {
-    console.error("SSLCommerz MCP (SSE) running on port " + PORT);
+    console.error("SSLCommerz MCP running on port " + PORT);
+    console.error("  Streamable HTTP: POST /mcp");
+    console.error("  Legacy SSE:      GET  /sse");
   });
 
 } else {
   const server = createServer();
-  const transport = new StdioServerTransport();
+  const { StdioServerTransport: Stdio } = await import("@modelcontextprotocol/sdk/server/stdio.js");
+  const transport = new Stdio();
   await server.connect(transport);
   console.error("SSLCommerz MCP (stdio) ready");
 }
