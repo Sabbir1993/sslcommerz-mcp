@@ -827,7 +827,7 @@ function createServer() {
 // ─────────────────────────────────────────────────────────────────────────────
 // TRANSPORT
 // ─────────────────────────────────────────────────────────────────────────────
-const USE_HTTP = process.env.TRANSPORT === "http" || !!process.env.PORT;
+const USE_HTTP = true;
 
 if (USE_HTTP) {
   const app = express();
