@@ -938,7 +938,7 @@ if (USE_HTTP) {
     }
   });
 
-  const PORT = process.env.PORT || 3000;
+  const PORT = 3003;
   app.listen(PORT, "0.0.0.0", () => {
     console.error("SSLCommerz MCP running on port " + PORT);
     console.error("  Streamable HTTP: POST /mcp");
